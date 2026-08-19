@@ -934,6 +934,8 @@ func MessageResourceDownloadFlags() []shortcut.Flag {
 		{Name: "download-resources", Type: shortcut.FlagBool, Desc: "自动下载消息中的全部可识别 mediaId/fileId 资源"},
 		{Name: "output-dir", Type: shortcut.FlagString, Default: "./downloads", Desc: "资源输出目录；必须是工作目录内的相对路径，禁止绝对路径和 .. 逃逸"},
 		{Name: "overwrite", Type: shortcut.FlagBool, Desc: "允许覆盖工作目录内已存在的本地输出文件（默认拒绝）"},
+		{Name: "max-file-size", Type: shortcut.FlagInt, Default: "1073741824", Desc: "单个资源下载大小上限（字节，默认 1GiB；0=不限）；超限拒绝且不落盘"},
+		{Name: "max-total-size", Type: shortcut.FlagInt, Default: "0", Desc: "本次下载资源总量上限（字节，0=不限）；超限中止后续下载并保留已下载文件"},
 	}
 }
 
@@ -952,7 +954,15 @@ func ValidateMessageResourceDownload(rt *shortcut.RuntimeContext) error {
 	if !rt.Bool("download-resources") {
 		return nil
 	}
-	return validateResourceDownloadOutputFlag(rt.Str("output-dir"), "--output-dir")
+	if err := validateResourceDownloadOutputFlag(rt.Str("output-dir"), "--output-dir"); err != nil {
+		return err
+	}
+	for _, name := range []string{"max-file-size", "max-total-size"} {
+		if rt.Changed(name) && rt.Int(name) < 0 {
+			return apperrors.NewValidation("--" + name + " 不能为负数")
+		}
+	}
+	return nil
 }
 
 // DownloadMessageResources downloads every unique message resource reference
@@ -1039,9 +1049,12 @@ func DownloadMessageResources(
 		}
 	}
 	outputDir := strings.TrimRight(rt.Str("output-dir"), `/\`)
+	maxFileSize := int64(rt.Int("max-file-size"))
+	maxTotalSize := int64(rt.Int("max-total-size"))
 	downloads := make([]map[string]any, 0, len(resources))
 	failures := make([]map[string]any, 0)
 	downloadedNames := map[string]bool{}
+	totalDownloaded := int64(0)
 	for _, resource := range resources {
 		resourceType := strings.TrimSpace(fmt.Sprint(resource["type"]))
 		if canonicalType, ok := canonicalMessageResourceType(resourceType); ok {
@@ -1116,8 +1129,12 @@ func DownloadMessageResources(
 			})
 			continue
 		}
+		downloadCtx := rt.Command().Context()
+		if maxFileSize > 0 {
+			downloadCtx = withResourceDownloadLimits(downloadCtx, maxFileSize)
+		}
 		size, downloadErr := resourceDownload(
-			rt.Command().Context(), nil, resourceURL, headers, destPath, rt.Bool("overwrite"))
+			downloadCtx, nil, resourceURL, headers, destPath, rt.Bool("overwrite"))
 		if downloadErr != nil {
 			failures = append(failures, map[string]any{
 				"resourceType": resourceType,
@@ -1126,6 +1143,17 @@ func DownloadMessageResources(
 				"error":        downloadErr.Error(),
 			})
 			continue
+		}
+		totalDownloaded += size
+		if maxTotalSize > 0 && totalDownloaded > maxTotalSize {
+			failures = append(failures, map[string]any{
+				"resourceType": resourceType,
+				"resourceId":   resourceID,
+				"messageId":    messageID,
+				"stage":        "total-limit",
+				"error":        fmt.Sprintf("本次下载总量将超过上限 %d 字节（已下载 %d 字节）", maxTotalSize, totalDownloaded),
+			})
+			break
 		}
 		downloadedNames[strings.ToLower(filepath.Base(relativePath))] = true
 		downloads = append(downloads, map[string]any{

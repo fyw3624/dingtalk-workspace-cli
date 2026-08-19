@@ -33,6 +33,57 @@ import (
 
 const resourceDownloadTimeout = 10 * time.Minute
 
+// resourceDownloadDefaultMaxFileSize bounds a single resource download when
+// --max-file-size is not set. 1 GiB is 10x the DingTalk 100 MB upload ceiling:
+// it only rejects pathological streams while never affecting normal files.
+const resourceDownloadDefaultMaxFileSize int64 = 1 << 30
+
+// resourceDownloadLimits is carried through the request context so the
+// single-file downloader can enforce --max-file-size without widening its
+// public signature (the resourceDownload seam stays mockable unchanged).
+type resourceDownloadLimits struct {
+	maxFileSize int64
+}
+
+var resourceDownloadLimitsKey = struct{}{}
+
+func withResourceDownloadLimits(ctx context.Context, maxFileSize int64) context.Context {
+	if maxFileSize <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, resourceDownloadLimitsKey, resourceDownloadLimits{
+		maxFileSize: maxFileSize,
+	})
+}
+
+func resourceDownloadMaxFileSize(ctx context.Context) int64 {
+	if v, ok := ctx.Value(resourceDownloadLimitsKey).(resourceDownloadLimits); ok {
+		return v.maxFileSize
+	}
+	return 0
+}
+
+// checkResourceDownloadSize enforces the single-file download cap. A
+// non-positive limit disables the guard. The declared size comes from
+// Content-Length (when known) and is checked before any byte is written;
+// the actual size is checked after streaming for servers without a length.
+func checkResourceDownloadSize(maxFileSize, declared, actual int64) error {
+	if maxFileSize <= 0 {
+		return nil
+	}
+	if declared > maxFileSize {
+		return apperrors.NewValidation(fmt.Sprintf(
+			"消息资源超过单文件下载上限 %d 字节（声明 %d 字节）",
+			maxFileSize, declared))
+	}
+	if actual > maxFileSize {
+		return apperrors.NewValidation(fmt.Sprintf(
+			"消息资源超过单文件下载上限 %d 字节（实际下载 %d 字节）",
+			maxFileSize, actual))
+	}
+	return nil
+}
+
 var (
 	resourceGetwd        = os.Getwd
 	resourceAbs          = filepath.Abs
@@ -569,6 +620,12 @@ func downloadResourceAtomically(
 			"下载消息资源失败: HTTP %d", response.StatusCode))
 	}
 
+	// Fail closed on a declared oversized file before touching the disk.
+	if err := checkResourceDownloadSize(
+		resourceDownloadMaxFileSize(ctx), response.ContentLength, 0); err != nil {
+		return 0, err
+	}
+
 	parent := filepath.Dir(destPath)
 	temp, err := resourceCreateTemp(parent, "."+filepath.Base(destPath)+".part-*")
 	if err != nil {
@@ -580,9 +637,20 @@ func downloadResourceAtomically(
 		_ = os.Remove(tempPath)
 	}()
 
-	size, err = resourceCopy(temp, response.Body)
+	var body io.Reader = response.Body
+	if maxFileSize := resourceDownloadMaxFileSize(ctx); maxFileSize > 0 {
+		// Stream guard for servers without Content-Length: read at most
+		// maxFileSize+1 bytes, then reject. The deferred cleanup removes the
+		// partial temp file, so destPath never sees a truncated artifact.
+		body = io.LimitReader(response.Body, maxFileSize+1)
+	}
+	size, err = resourceCopy(temp, body)
 	if err != nil {
 		return 0, apperrors.NewAPI(fmt.Sprintf("写入消息资源失败: %v", err))
+	}
+	if err := checkResourceDownloadSize(
+		resourceDownloadMaxFileSize(ctx), 0, size); err != nil {
+		return 0, err
 	}
 	if response.ContentLength >= 0 && size != response.ContentLength {
 		return 0, apperrors.NewAPI(fmt.Sprintf(

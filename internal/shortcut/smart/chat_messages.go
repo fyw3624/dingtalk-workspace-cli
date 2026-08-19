@@ -124,6 +124,7 @@ var ChatMessages = shortcut.Shortcut{
 		{Name: "max-results", Type: shortcut.FlagInt, Desc: "--max-items 的公开兼容别名；--max-results 仅与 --page-all 一起使用且不能为负数"},
 		{Name: "page-delay", Type: shortcut.FlagInt, Desc: "自动翻页每页之间等待毫秒数（默认 0 表示不等待）；--page-delay 仅与 --page-all 一起使用且不能为负数"},
 		{Name: "output", Shorthand: "o", Type: shortcut.FlagString, Desc: "把完整结构化 ledger 原子写入工作目录内的相对 JSON 文件"},
+		{Name: "checkpoint-file", Type: shortcut.FlagString, Desc: "断点续拉状态文件（工作目录内相对 JSON）：存在且会话匹配且未显式指定时间/方向时作为初始游标，干净完成后原子写回；默认不改变任何读取行为"},
 	}, chatshortcut.MessageResourceDownloadFlags()...),
 	Constraints: append([]shortcut.Constraint{
 		{Kind: shortcut.ConstraintExactlyOne, Flags: []string{"group", "conversation-id", "id", "open-conversation-id", "chat-query", "user", "user-query", "open-dingtalk-id"}},
@@ -212,6 +213,11 @@ func validateChatMessages(rt *shortcut.RuntimeContext) error {
 		}
 	} else if rt.Bool("overwrite") {
 		return apperrors.NewValidation("--overwrite 仅与 --output 一起使用")
+	}
+	if rt.Changed("checkpoint-file") {
+		if err := validateCheckpointFilePath(rt.Str("checkpoint-file")); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -569,6 +575,11 @@ func executeChatMessages(rt *shortcut.RuntimeContext) error {
 	if err != nil {
 		return err
 	}
+	checkpointPath := ""
+	if rt.Changed("checkpoint-file") {
+		checkpointPath = strings.TrimSpace(rt.Str("checkpoint-file"))
+		applyChatMessagesCheckpoint(rt, &request, checkpointPath)
+	}
 	var payload map[string]any
 	var rawItems []map[string]any
 	if rt.Bool("page-all") {
@@ -642,6 +653,11 @@ func executeChatMessages(rt *shortcut.RuntimeContext) error {
 				"localPath": path,
 				"sizeBytes": size,
 			}
+		}
+	}
+	if checkpointPath != "" {
+		if checkpointErr := writeChatMessagesCheckpoint(rt, &request, payload, checkpointPath); checkpointErr != nil {
+			return checkpointErr
 		}
 	}
 	return rt.Output(payload)

@@ -15,17 +15,52 @@
 
 package helpers
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+	"syscall"
+)
 
-// daemonDetachSupported is false on Windows: the daemon uses POSIX setsid +
-// signal-based stop, which has no direct equivalent here. `connect --daemon`
-// errors out on Windows and users should run the foreground connector under a
-// Windows service wrapper instead.
-const daemonDetachSupported = false
+// createNewProcessGroup (0x00000200) prevents the child from receiving the
+// parent's Ctrl+C console event, mirroring Setsid on Unix. Combined with
+// HideWindow this lets a re-exec'd supervisor outlive the parent terminal.
+const createNewProcessGroup = 0x00000200
 
-// applyDetach is a no-op on Windows; daemon mode is rejected earlier.
-func applyDetach(_ *exec.Cmd) {}
+// daemonDetachSupported enables `connect --daemon` on Windows: the supervisor
+// is spawned as a hidden, console-detached child (CREATE_NEW_PROCESS_GROUP +
+// HideWindow) and is stopped via TerminateProcess, which os.Process.Kill maps
+// to on Windows.
+const daemonDetachSupported = true
 
-func configureWorkerProcessGroup(_ *exec.Cmd) {}
+func detachSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		CreationFlags: createNewProcessGroup,
+		HideWindow:    true,
+	}
+}
 
+// applyDetach hides the daemon child and detaches it from the parent console.
+func applyDetach(cmd *exec.Cmd) {
+	cmd.SysProcAttr = detachSysProcAttr()
+}
+
+// configureWorkerProcessGroup gives the connector worker the same detached,
+// hidden treatment so agent processes it spawns do not attach to any console.
+func configureWorkerProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = detachSysProcAttr()
+}
+
+// cleanupWorkerProcessGroup is a no-op on Windows: there is no process-group
+// kill; the worker's own termination cleans its children.
 func cleanupWorkerProcessGroup(_ int) {}
+
+// init installs the Windows stop primitive. Windows has no POSIX-style
+// graceful signals: os.Process.Signal returns syscall.EWINDOWS for everything
+// except Kill. daemonSignalProcess therefore maps any requested signal to
+// TerminateProcess so both the graceful-stop and force-kill paths of the
+// daemon supervisor terminate the process deterministically.
+func init() {
+	daemonSignalProcess = func(process *os.Process, _ os.Signal) error {
+		return process.Kill()
+	}
+}

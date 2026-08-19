@@ -569,6 +569,11 @@ func executeChatMessages(rt *shortcut.RuntimeContext) error {
 	if err != nil {
 		return err
 	}
+	if kind, id := chatMessagesConversationIdentity(&request); kind != "" {
+		if err := chatshortcut.ValidateConversationReadAccess(kind, id); err != nil {
+			return err
+		}
+	}
 	var payload map[string]any
 	var rawItems []map[string]any
 	if rt.Bool("page-all") {
@@ -920,6 +925,22 @@ func projectChatMessages(items []map[string]any, includeReactions bool) []map[st
 }
 
 // chatMessagesNextCursorBoundary converts the authoritative millisecond
+// chatMessagesConversationIdentity derives the stable conversation identity
+// of the resolved request (group openConversationId / user openDingTalkId or
+// userId) used for conversation-policy enforcement.
+func chatMessagesConversationIdentity(request *chatMessagesRequest) (kind, id string) {
+	if request.fallbackConversationID != "" {
+		return "group", request.fallbackConversationID
+	}
+	if value, ok := request.params["openDingTalkId"].(string); ok && value != "" {
+		return "user", value
+	}
+	if value, ok := request.params["userId"].(string); ok && value != "" {
+		return "user", value
+	}
+	return "", ""
+}
+
 // cursor returned by DingTalk message-list tools into the exact RFC3339Nano
 // boundary accepted by their time parameter. Projected createTime is only
 // second precision and must never drive pagination: doing so skips messages
